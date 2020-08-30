@@ -360,9 +360,7 @@ func (child *partitionConsumer) dispatcher() {
 }
 
 func (child *partitionConsumer) dispatch() error {
-	if err := child.consumer.client.RefreshMetadata(child.topic); err != nil {
-		return err
-	}
+	child.consumer.client.NeedUpdateMetadata(child.topic)
 
 	var leader *Broker
 	var err error

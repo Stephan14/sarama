@@ -160,9 +160,8 @@ func (c *consumerGroup) Consume(ctx context.Context, topics []string, handler Co
 		return fmt.Errorf("no topics provided")
 	}
 
-	// Refresh metadata for requested topics
-	if err := c.client.RefreshMetadata(topics...); err != nil {
-		return err
+	for _, topic := range topics {
+		c.client.NeedUpdateMetadata(topic)
 	}
 
 	// Init session

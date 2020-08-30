@@ -4,6 +4,7 @@ import (
 	"math/rand"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -85,6 +86,9 @@ type Client interface {
 	// InitProducerID retrieves information required for Idempotent Producer
 	InitProducerID() (*InitProducerIDResponse, error)
 
+	//client need to update metadata about topic
+	NeedUpdateMetadata(topic string)
+
 	// Close shuts down all broker connections managed by this client. It is required
 	// to call this function before a client object passes out of scope, as it will
 	// otherwise leak memory. You must close any Producers or Consumers using a client
@@ -129,6 +133,9 @@ type client struct {
 	cachedPartitionsResults map[string][maxPartitionIndex][]int32
 
 	lock sync.RWMutex // protects access to the maps that hold cluster state.
+
+	cond              *Cond
+	isNeedUpdateMetadata atomic.Value
 }
 
 // NewClient creates a new Client. It connects to one of the given broker addresses
@@ -158,7 +165,9 @@ func NewClient(addrs []string, conf *Config) (Client, error) {
 		metadataTopics:          make(map[string]none),
 		cachedPartitionsResults: make(map[string][maxPartitionIndex][]int32),
 		coordinators:            make(map[string]int32),
+		cond:                    NewCond(&sync.Mutex{}),
 	}
+	client.isNeedUpdateMetadata.Store(false)
 
 	client.randomizeSeedBrokers(addrs)
 
@@ -189,8 +198,8 @@ func (client *client) Config() *Config {
 }
 
 func (client *client) Brokers() []*Broker {
-	client.lock.RLock()
-	defer client.lock.RUnlock()
+	client.cond.L.Lock()
+	defer client.cond.L.Unlock()
 	brokers := make([]*Broker, 0, len(client.brokers))
 	for _, broker := range client.brokers {
 		brokers = append(brokers, broker)
@@ -229,8 +238,8 @@ func (client *client) Close() error {
 	close(client.closer)
 	<-client.closed
 
-	client.lock.Lock()
-	defer client.lock.Unlock()
+	client.cond.L.Lock()
+	defer client.cond.L.Unlock()
 	Logger.Println("Closing Client")
 
 	for _, broker := range client.brokers {
@@ -249,10 +258,18 @@ func (client *client) Close() error {
 }
 
 func (client *client) Closed() bool {
-	client.lock.RLock()
-	defer client.lock.RUnlock()
+	client.cond.L.Lock()
+	defer client.cond.L.Unlock()
 
 	return client.brokers == nil
+}
+
+func (client *client) NeedUpdateMetadata(topic string) {
+	client.cond.L.Lock()
+	client.metadataTopics[topic] = none{}
+	client.cond.L.Unlock()
+
+	client.isNeedUpdateMetadata.Store(true)
 }
 
 func (client *client) Topics() ([]string, error) {
@@ -260,8 +277,8 @@ func (client *client) Topics() ([]string, error) {
 		return nil, ErrClosedClient
 	}
 
-	client.lock.RLock()
-	defer client.lock.RUnlock()
+	client.cond.L.Lock()
+	defer client.cond.L.Unlock()
 
 	ret := make([]string, 0, len(client.metadata))
 	for topic := range client.metadata {
@@ -276,8 +293,8 @@ func (client *client) MetadataTopics() ([]string, error) {
 		return nil, ErrClosedClient
 	}
 
-	client.lock.RLock()
-	defer client.lock.RUnlock()
+	client.cond.L.Lock()
+	defer client.cond.L.Unlock()
 
 	ret := make([]string, 0, len(client.metadataTopics))
 	for topic := range client.metadataTopics {
@@ -292,18 +309,19 @@ func (client *client) Partitions(topic string) ([]int32, error) {
 		return nil, ErrClosedClient
 	}
 
+	client.cond.L.Lock()
 	partitions := client.cachedPartitions(topic, allPartitions)
-
-	if len(partitions) == 0 {
-		err := client.RefreshMetadata(topic)
-		if err != nil {
-			return nil, err
-		}
+	startTime := time.Now()
+	for partitions == nil && time.Now().Sub(startTime) <= client.conf.Metadata.Timeout {
+		client.metadataTopics[topic] = none{}
+		client.isNeedUpdateMetadata.Store(true)
+		client.cond.WaitWithTimeout(client.conf.Metadata.Timeout)
 		partitions = client.cachedPartitions(topic, allPartitions)
 	}
+	client.cond.L.Unlock()
 
 	// no partitions found after refresh metadata
-	if len(partitions) == 0 {
+	if partitions == nil || len(partitions) == 0 {
 		return nil, ErrUnknownTopicOrPartition
 	}
 
@@ -315,21 +333,16 @@ func (client *client) WritablePartitions(topic string) ([]int32, error) {
 		return nil, ErrClosedClient
 	}
 
+	client.cond.L.Lock()
 	partitions := client.cachedPartitions(topic, writablePartitions)
-
-	// len==0 catches when it's nil (no such topic) and the odd case when every single
-	// partition is undergoing leader election simultaneously. Callers have to be able to handle
-	// this function returning an empty slice (which is a valid return value) but catching it
-	// here the first time (note we *don't* catch it below where we return ErrUnknownTopicOrPartition) triggers
-	// a metadata refresh as a nicety so callers can just try again and don't have to manually
-	// trigger a refresh (otherwise they'd just keep getting a stale cached copy).
-	if len(partitions) == 0 {
-		err := client.RefreshMetadata(topic)
-		if err != nil {
-			return nil, err
-		}
+	startTime := time.Now()
+	for partitions == nil && time.Now().Sub(startTime) <= client.conf.Metadata.Timeout {
+		client.metadataTopics[topic] = none{}
+		client.isNeedUpdateMetadata.Store(true)
+		client.cond.WaitWithTimeout(client.conf.Metadata.Timeout)
 		partitions = client.cachedPartitions(topic, writablePartitions)
 	}
+	client.cond.L.Unlock()
 
 	if partitions == nil {
 		return nil, ErrUnknownTopicOrPartition
@@ -343,15 +356,16 @@ func (client *client) Replicas(topic string, partitionID int32) ([]int32, error)
 		return nil, ErrClosedClient
 	}
 
+	client.cond.L.Lock()
 	metadata := client.cachedMetadata(topic, partitionID)
-
-	if metadata == nil {
-		err := client.RefreshMetadata(topic)
-		if err != nil {
-			return nil, err
-		}
+	startTime := time.Now()
+	for metadata == nil && time.Now().Sub(startTime) <= client.conf.Metadata.Timeout {
+		client.metadataTopics[topic] = none{}
+		client.isNeedUpdateMetadata.Store(true)
+		client.cond.WaitWithTimeout(client.conf.Producer.Timeout)
 		metadata = client.cachedMetadata(topic, partitionID)
 	}
+	client.cond.L.Unlock()
 
 	if metadata == nil {
 		return nil, ErrUnknownTopicOrPartition
@@ -368,15 +382,16 @@ func (client *client) InSyncReplicas(topic string, partitionID int32) ([]int32, 
 		return nil, ErrClosedClient
 	}
 
+	client.cond.L.Lock()
 	metadata := client.cachedMetadata(topic, partitionID)
-
-	if metadata == nil {
-		err := client.RefreshMetadata(topic)
-		if err != nil {
-			return nil, err
-		}
+	startTime := time.Now()
+	for metadata == nil && time.Now().Sub(startTime) <= client.conf.Metadata.Timeout {
+		client.metadataTopics[topic] = none{}
+		client.isNeedUpdateMetadata.Store(true)
+		client.cond.WaitWithTimeout(client.conf.Producer.Timeout)
 		metadata = client.cachedMetadata(topic, partitionID)
 	}
+	client.cond.L.Unlock()
 
 	if metadata == nil {
 		return nil, ErrUnknownTopicOrPartition
@@ -393,15 +408,16 @@ func (client *client) OfflineReplicas(topic string, partitionID int32) ([]int32,
 		return nil, ErrClosedClient
 	}
 
+	client.cond.L.Lock()
 	metadata := client.cachedMetadata(topic, partitionID)
-
-	if metadata == nil {
-		err := client.RefreshMetadata(topic)
-		if err != nil {
-			return nil, err
-		}
+	startTime := time.Now()
+	for metadata == nil && time.Now().Sub(startTime) <= client.conf.Metadata.Timeout {
+		client.metadataTopics[topic] = none{}
+		client.isNeedUpdateMetadata.Store(true)
+		client.cond.WaitWithTimeout(client.conf.Producer.Timeout)
 		metadata = client.cachedMetadata(topic, partitionID)
 	}
+	client.cond.L.Unlock()
 
 	if metadata == nil {
 		return nil, ErrUnknownTopicOrPartition
@@ -418,13 +434,14 @@ func (client *client) Leader(topic string, partitionID int32) (*Broker, error) {
 		return nil, ErrClosedClient
 	}
 
+	client.cond.L.Lock()
+	defer client.cond.L.Unlock()
 	leader, err := client.cachedLeader(topic, partitionID)
-
-	if leader == nil {
-		err = client.RefreshMetadata(topic)
-		if err != nil {
-			return nil, err
-		}
+	startTime := time.Now()
+	for leader == nil && time.Now().Sub(startTime) <= client.conf.Metadata.Timeout {
+		client.metadataTopics[topic] = none{}
+		client.isNeedUpdateMetadata.Store(true)
+		client.cond.WaitWithTimeout(client.conf.Metadata.Timeout)
 		leader, err = client.cachedLeader(topic, partitionID)
 	}
 
@@ -436,8 +453,8 @@ func (client *client) RefreshBrokers(addrs []string) error {
 		return ErrClosedClient
 	}
 
-	client.lock.Lock()
-	defer client.lock.Unlock()
+	client.cond.L.Lock()
+	defer client.cond.L.Unlock()
 
 	for _, broker := range client.brokers {
 		_ = broker.Close()
@@ -478,16 +495,7 @@ func (client *client) GetOffset(topic string, partitionID int32, time int64) (in
 		return -1, ErrClosedClient
 	}
 
-	offset, err := client.getOffset(topic, partitionID, time)
-
-	if err != nil {
-		if err := client.RefreshMetadata(topic); err != nil {
-			return -1, err
-		}
-		return client.getOffset(topic, partitionID, time)
-	}
-
-	return offset, err
+	return  client.getOffset(topic, partitionID, time)
 }
 
 func (client *client) Controller() (*Broker, error) {
@@ -517,8 +525,9 @@ func (client *client) Controller() (*Broker, error) {
 
 // deregisterController removes the cached controllerID
 func (client *client) deregisterController() {
-	client.lock.Lock()
-	defer client.lock.Unlock()
+	client.cond.L.Lock()
+	defer client.cond.L.Unlock()
+
 	delete(client.brokers, client.controllerID)
 }
 
@@ -576,8 +585,8 @@ func (client *client) RefreshCoordinator(consumerGroup string) error {
 		return err
 	}
 
-	client.lock.Lock()
-	defer client.lock.Unlock()
+	client.cond.L.Lock()
+	defer client.cond.L.Unlock()
 	client.registerBroker(response.Coordinator)
 	client.coordinators[consumerGroup] = response.Coordinator.ID()
 	return nil
@@ -638,8 +647,8 @@ func (client *client) registerBroker(broker *Broker) {
 // deregisterBroker removes a broker from the seedsBroker list, and if it's
 // not the seedbroker, removes it from brokers map completely.
 func (client *client) deregisterBroker(broker *Broker) {
-	client.lock.Lock()
-	defer client.lock.Unlock()
+	client.cond.L.Lock()
+	defer client.cond.L.Unlock()
 
 	if len(client.seedBrokers) > 0 && broker == client.seedBrokers[0] {
 		client.deadSeeds = append(client.deadSeeds, broker)
@@ -655,8 +664,8 @@ func (client *client) deregisterBroker(broker *Broker) {
 }
 
 func (client *client) resurrectDeadBrokers() {
-	client.lock.Lock()
-	defer client.lock.Unlock()
+	client.cond.L.Lock()
+	defer client.cond.L.Unlock()
 
 	Logger.Printf("client/brokers resurrecting %d dead seed brokers", len(client.deadSeeds))
 	client.seedBrokers = append(client.seedBrokers, client.deadSeeds...)
@@ -664,8 +673,8 @@ func (client *client) resurrectDeadBrokers() {
 }
 
 func (client *client) any() *Broker {
-	client.lock.RLock()
-	defer client.lock.RUnlock()
+	client.cond.L.Lock()
+	defer client.cond.L.Unlock()
 
 	if len(client.seedBrokers) > 0 {
 		_ = client.seedBrokers[0].Open(client.conf)
@@ -695,8 +704,6 @@ const (
 )
 
 func (client *client) cachedMetadata(topic string, partitionID int32) *PartitionMetadata {
-	client.lock.RLock()
-	defer client.lock.RUnlock()
 
 	partitions := client.metadata[topic]
 	if partitions != nil {
@@ -707,8 +714,6 @@ func (client *client) cachedMetadata(topic string, partitionID int32) *Partition
 }
 
 func (client *client) cachedPartitions(topic string, partitionSet partitionType) []int32 {
-	client.lock.RLock()
-	defer client.lock.RUnlock()
 
 	partitions, exists := client.cachedPartitionsResults[topic]
 
@@ -738,8 +743,6 @@ func (client *client) setPartitionCache(topic string, partitionSet partitionType
 }
 
 func (client *client) cachedLeader(topic string, partitionID int32) (*Broker, error) {
-	client.lock.RLock()
-	defer client.lock.RUnlock()
 
 	partitions := client.metadata[topic]
 	if partitions != nil {
@@ -802,17 +805,30 @@ func (client *client) backgroundMetadataUpdater() {
 		return
 	}
 
-	ticker := time.NewTicker(client.conf.Metadata.RefreshFrequency)
-	defer ticker.Stop()
+	timer := time.NewTimer(client.conf.Metadata.RefreshFrequency)
+	defer timer.Stop()
 
 	for {
 		select {
-		case <-ticker.C:
+		case <-timer.C:
 			if err := client.refreshMetadata(); err != nil {
-				Logger.Println("Client background metadata update:", err)
+				Logger.Println("Client background metadata update for timer:", err)
+				timer.Reset(client.conf.Metadata.Retry.Backoff)
+			} else {
+				timer.Reset(client.conf.Metadata.RefreshFrequency)
 			}
 		case <-client.closer:
 			return
+		default:
+			if client.isNeedUpdateMetadata.Load().(bool) {
+				if err := client.refreshMetadata(); err != nil {
+					Logger.Println("Client background metadata update for need update metadata:", err)
+					time.Sleep(client.conf.Metadata.Retry.Backoff)
+				} else {
+					client.isNeedUpdateMetadata.Store(false)
+					timer.Reset(client.conf.Metadata.RefreshFrequency)
+				}
+			}
 		}
 	}
 }
@@ -933,8 +949,8 @@ func (client *client) updateMetadata(data *MetadataResponse, allKnownMetaData bo
 		return
 	}
 
-	client.lock.Lock()
-	defer client.lock.Unlock()
+	client.cond.L.Lock()
+	defer client.cond.L.Unlock()
 
 	// For all the brokers we received:
 	// - if it is a new ID, save it
@@ -991,13 +1007,14 @@ func (client *client) updateMetadata(data *MetadataResponse, allKnownMetaData bo
 		partitionCache[writablePartitions] = client.setPartitionCache(topic.Name, writablePartitions)
 		client.cachedPartitionsResults[topic.Name] = partitionCache
 	}
+	client.cond.Broadcast()
 
 	return
 }
 
 func (client *client) cachedCoordinator(consumerGroup string) *Broker {
-	client.lock.RLock()
-	defer client.lock.RUnlock()
+	client.cond.L.Lock()
+	defer client.cond.L.Unlock()
 	if coordinatorID, ok := client.coordinators[consumerGroup]; ok {
 		return client.brokers[coordinatorID]
 	}
@@ -1005,9 +1022,8 @@ func (client *client) cachedCoordinator(consumerGroup string) *Broker {
 }
 
 func (client *client) cachedController() *Broker {
-	client.lock.RLock()
-	defer client.lock.RUnlock()
-
+	client.cond.L.Lock()
+	defer client.cond.L.Unlock()
 	return client.brokers[client.controllerID]
 }
 

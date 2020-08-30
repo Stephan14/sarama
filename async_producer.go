@@ -650,10 +650,7 @@ func (pp *partitionProducer) flushRetryBuffers() {
 
 func (pp *partitionProducer) updateLeader() error {
 	return pp.breaker.Run(func() (err error) {
-		if err = pp.parent.client.RefreshMetadata(pp.topic); err != nil {
-			return err
-		}
-
+		pp.parent.client.NeedUpdateMetadata(pp.topic)
 		if pp.leader, err = pp.parent.client.Leader(pp.topic, pp.partition); err != nil {
 			return err
 		}
